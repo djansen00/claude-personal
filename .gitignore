@@ -1,0 +1,9 @@
+# Superseded in-place backups — git history is the backup now.
+*.bak-*
+*.bak
+*.pre-*
+
+# Never: credentials and machine state live in ~/.claude, not here, but guard anyway.
+*creds*.json
+*secret*
+.env

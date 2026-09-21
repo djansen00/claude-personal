@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# Create a new semi-permanent "warm" Omnibus worktree under ~/source/repos/<slug>
+# modeled on the current 5-repo pattern (see SKILL.md for the why behind each step).
+#
+# Usage:  create-warm-worktree.sh <slug>
+# Example: create-warm-worktree.sh subrights
+#
+# Idempotency: refuses to run if ~/source/repos/<slug> already exists. It does NOT
+# clean up partial state on failure — if it dies mid-run, inspect and remove
+# ~/source/repos/<slug> + the feature/<slug>-wt branches before retrying.
+set -euo pipefail
+
+SLUG="${1:-}"
+[[ -n "$SLUG" ]] || { echo "usage: $0 <slug>" >&2; exit 2; }
+[[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "slug must be lowercase-kebab" >&2; exit 2; }
+
+MAIN="$HOME/projects/omnibus"          # the main checkouts (worktree host repos)
+REPOS="$HOME/source/repos"
+WT="$REPOS/$SLUG"
+BRANCH="feature/${SLUG}-wt"
+[[ ! -e "$WT" ]] || { echo "$WT already exists — refusing to clobber" >&2; exit 1; }
+
+# Repo -> base branch. The four code repos branch from release; Treeline.Workspaces
+# (docs/skills/CLAUDE.md) defaults to main. Omitting Treeline.Workspaces is the
+# STALE pattern (title-manager/quickfix) — the current pattern includes all five.
+declare -A BASE=(
+  [Treeline.Clients.EdelweissComponents]=release
+  [Treeline.Data]=release
+  [Treeline.Services.Omnibus]=release
+  [Treeline.Services.Ingest]=release
+  [Treeline.Workspaces]=main
+)
+REPO_ORDER=(Treeline.Clients.EdelweissComponents Treeline.Data \
+            Treeline.Services.Omnibus Treeline.Services.Ingest Treeline.Workspaces)
+
+# Pick an existing warm worktree to copy the sentinel + flattened workspace file
+# from. The root Treeline.Omnibus.code-workspace is the FLATTENED variant (./ sibling
+# paths) — it is NOT the same file as Treeline.Workspaces/Omnibus/...code-workspace
+# (which uses ../../). Always copy it from another warm-worktree ROOT.
+TEMPLATE=""
+for cand in subrights assets title-manager quickfix; do
+  if [[ -f "$REPOS/$cand/Treeline.Omnibus.code-workspace" ]]; then TEMPLATE="$cand"; break; fi
+done
+[[ -n "$TEMPLATE" ]] || { echo "no existing warm worktree to model from" >&2; exit 1; }
+
+# Pick the start-omni template script + its slug (for the per-field sed below).
+START_TPL=""
+for cand in subrights assets title-manager quickfix; do
+  if [[ -f "$HOME/start-omni-${cand}.sh" ]]; then START_TPL="$cand"; break; fi
+done
+[[ -n "$START_TPL" ]] || { echo "no start-omni-*.sh template found" >&2; exit 1; }
+
+echo ">> creating warm worktree '$SLUG' (branch $BRANCH, template '$TEMPLATE')"
+mkdir -p "$WT"
+
+# 1. The five git worktrees ------------------------------------------------------
+for repo in "${REPO_ORDER[@]}"; do
+  git -C "$MAIN/$repo" worktree add -b "$BRANCH" "$WT/$repo" "${BASE[$repo]}"
+done
+
+# 2. Sentinel + flattened root workspace file -----------------------------------
+cp -p "$REPOS/$TEMPLATE/.cc-keep-worktree" "$WT/.cc-keep-worktree"
+cp -p "$REPOS/$TEMPLATE/Treeline.Omnibus.code-workspace" "$WT/Treeline.Omnibus.code-workspace"
+
+# 2b. Project skills — MERGED directory, BOTH sources ---------------------------
+#     Claude Code discovers .claude/skills only at cwd and its PARENTS, never in
+#     subdirectories. TWO skill sets matter here:
+#       - the workspace repo's   Treeline.Workspaces/Omnibus/.claude/skills
+#       - the frontend repo's    Treeline.Clients.EdelweissComponents/.claude/skills
+#     The frontend one holds the UI design charters (omnibus-publisher-ui, and
+#     publisher-landing-design on the publisher-pages line of work). A single
+#     symlink to ONE source HIDES the other — that is exactly how the marketing
+#     charter got missed for an entire feature build and had to be retrofitted
+#     across 10 files. ~/sync-omni-skills.sh builds a real directory of per-skill
+#     symlinks into both repos (verified: the resolver follows symlinked skill
+#     dirs). The area root is not a git repo, so none of this is tracked.
+mkdir -p "$WT/.claude"
+if [[ -x "$HOME/sync-omni-skills.sh" ]]; then
+  "$HOME/sync-omni-skills.sh" "$SLUG"
+else
+  echo "WARN: ~/sync-omni-skills.sh is missing — falling back to the workspace-only" >&2
+  echo "      symlink. The frontend repo's UI design charters will NOT be" >&2
+  echo "      discoverable from the area root. Restore the script and re-run it." >&2
+  ln -sfn ../Treeline.Workspaces/Omnibus/.claude/skills "$WT/.claude/skills"
+fi
+
+# 3. Seed gitignored local config declared in each repo's .worktreeinclude -------
+#    (env files, appsettings.Local.json, etc. — never committed, so a fresh
+#    worktree lacks them.) Ingest has NO .worktreeinclude: its appsettings.Local.json
+#    is seeded at dev-stack START time by start-omni-<slug>.sh, not here.
+seed_repo() {
+  local repo="$1" inc="$MAIN/$1/.worktreeinclude" pat name rel src dst
+  [[ -f "$inc" ]] || return 0
+  while IFS= read -r pat; do
+    pat="${pat%%#*}"; pat="$(echo -n "$pat" | xargs)"; [[ -z "$pat" ]] && continue
+    if [[ "$pat" == '**/'* ]]; then
+      name="${pat#**/}"
+      while IFS= read -r src; do
+        rel="${src#"$MAIN/$repo/"}"; dst="$WT/$repo/$rel"
+        mkdir -p "$(dirname "$dst")"; cp -p "$src" "$dst" && echo "   seed $repo/$rel"
+      done < <(find "$MAIN/$repo" -type f -name "$name" -not -path '*/node_modules/*' 2>/dev/null)
+    elif [[ -f "$MAIN/$repo/$pat" ]]; then
+      mkdir -p "$(dirname "$WT/$repo/$pat")"; cp -p "$MAIN/$repo/$pat" "$WT/$repo/$pat" && echo "   seed $repo/$pat"
+    fi
+  done < "$inc"
+}
+for repo in "${REPO_ORDER[@]}"; do seed_repo "$repo"; done
+
+# 4. Run the EdelweissComponents .worktreesetup hook equivalent ------------------
+#    mise MUST be trusted before install (a fresh worktree's mise.toml is untrusted
+#    and `mise install` aborts otherwise).
+EC="$WT/Treeline.Clients.EdelweissComponents"
+( cd "$EC"
+  if command -v mise >/dev/null 2>&1 && [[ -f mise.toml ]]; then
+    mise trust ./mise.toml >/dev/null 2>&1 || true
+    mise install || true
+  fi
+  if command -v mkcert >/dev/null 2>&1; then
+    mkdir -p packages/apps/omnibus/certs
+    ( cd packages/apps/omnibus/certs && mkcert local.edelweiss.plus localhost 127.0.0.1 )
+  fi
+  echo ">> npm install (this is the slow ~1.8GB step)…"
+  npm install
+)
+
+# 5. Home-dir Claude launcher  ~/<slug>.sh --------------------------------------
+cat > "$HOME/${SLUG}.sh" <<EOF
+#!/usr/bin/env bash
+cd $WT/ || exit 1
+# Show this area's dev-port block before handing off to claude, so the ports are
+# visible in the terminal as well as in the auto-loaded area-root CLAUDE.md.
+# Slug is derived by path-stripping (not basename) so it stays correct even if the
+# cd target is a subdirectory of the area root.
+_slug=\${PWD#$REPOS/}; _slug=\${_slug%%/*}
+if source "\$HOME/omni-ports.sh" 2>/dev/null && omni_ports "\$_slug" 2>/dev/null; then
+    printf '\\n  %s  ->  UI :%s   API :%s   Ingest API :%s   Ingest UI :%s\\n  start: ~/start-omni-%s.sh (foreground)\\n\\n' \\
+        "\$_slug" "\$UI_PORT" "\$API_PORT_HTTPS" "\$INGEST_API_PORT" "\$INGEST_UI_PORT" "\$_slug"
+fi
+exec claude -c "\$@"
+EOF
+chmod +x "$HOME/${SLUG}.sh"
+
+# 6. Home-dir dev-stack script  ~/start-omni-<slug>.sh --------------------------
+#    Clone the template and rewrite the per-area fields. The area-list comment gets
+#    the new slug appended (keeps every prior area in the list).
+cp -p "$HOME/start-omni-${START_TPL}.sh" "$HOME/start-omni-${SLUG}.sh"
+sed -i -E \
+  -e "s#Start the ${START_TPL} persistent#Start the ${SLUG} persistent#" \
+  -e "s#WORKTREE=$HOME/source/repos/${START_TPL}#WORKTREE=$HOME/source/repos/${SLUG}#" \
+  -e "s#-${START_TPL}\.log#-${SLUG}.log#g" \
+  -e "s#\[start-omni-${START_TPL}\]#[start-omni-${SLUG}]#" \
+  -e "s#(area worktrees \(.*)\)#\1 / ${SLUG})#" \
+  "$HOME/start-omni-${SLUG}.sh"
+chmod +x "$HOME/start-omni-${SLUG}.sh"
+
+# 6.2 Port block allocation in ~/omni-ports.sh ---------------------------------
+#     The new area needs its own block or its start script will hard-fail on an
+#     unknown slug. Offsets are handed out as (highest existing + 10), advancing
+#     past any offset whose block would land on a browser-blocked port (e.g.
+#     offset 60 yields the SIP ports 5060/5061, which sit on Chromium's
+#     kRestrictedPorts list — the server binds them and curl succeeds, but the
+#     browser fails every request with net::ERR_UNSAFE_PORT). Offsets are never
+#     reused — the table is append-only so existing areas keep the ports already
+#     written into their gitignored config.
+if [[ -f "$HOME/omni-ports.sh" ]]; then
+  if grep -qE "^${SLUG}:[0-9]+$" "$HOME/omni-ports.sh"; then
+    echo ">> port block for '$SLUG' already in ~/omni-ports.sh — leaving it alone"
+  else
+    # Source the table for OMNI_BLOCKED_PORTS — the single source of truth for
+    # the blocked-port list — rather than hardcoding a second copy here.
+    source "$HOME/omni-ports.sh"
+    NEXT_OFF=$(awk -F: '/^[A-Za-z0-9._-]+:[0-9]+$/ {if ($2+0 > max) max = $2+0} END {print max+10}' \
+      "$HOME/omni-ports.sh")
+    is_blocked_offset() {
+      local off="$1" p b
+      for p in $((3000+off)) $((3001+off)) $((5000+off)) $((5001+off)) $((5002+off)); do
+        for b in $OMNI_BLOCKED_PORTS; do
+          [[ "$p" == "$b" ]] && return 0
+        done
+      done
+      return 1
+    }
+    while is_blocked_offset "$NEXT_OFF"; do
+      echo ">> offset ${NEXT_OFF} lands on a browser-blocked port — skipping" >&2
+      NEXT_OFF=$((NEXT_OFF + 10))
+    done
+    sed -i "/^# <<< new areas appended here/i ${SLUG}:${NEXT_OFF}" "$HOME/omni-ports.sh"
+    echo ">> allocated port block offset ${NEXT_OFF} to '$SLUG' (UI $((3000+NEXT_OFF)), API https $((5001+NEXT_OFF)))"
+  fi
+else
+  echo "WARN: ~/omni-ports.sh missing — '$SLUG' has no port block and its start script will fail" >&2
+fi
+
+# 6.4 Materialize this area's port config + area-root CLAUDE.md ----------------
+#     Runs AFTER the port block is allocated (6.2) so omni_ports can resolve the
+#     new slug. Writes the gitignored appsettings/.env values, the git-excluded
+#     vite.config.local.mts shims, and the area-root CLAUDE.md that gives the FIRST
+#     Claude session in this area its port context — without this, the launcher
+#     works but the session has no idea which ports the area owns until the dev
+#     stack has been started once. Ingest's appsettings.Local.json does not exist
+#     yet at creation time, so a WARN for it here is expected and self-heals on the
+#     first start-omni run.
+if [[ -x "$HOME/omni-configure-area.sh" ]]; then
+  echo ">> materializing port config + area-root CLAUDE.md"
+  "$HOME/omni-configure-area.sh" "$SLUG" 2>&1 | sed 's/^/   /' || \
+    echo "WARN: omni-configure-area.sh reported a problem — check the area's ports by hand" >&2
+else
+  echo "WARN: ~/omni-configure-area.sh missing — no port config or CLAUDE.md written for '$SLUG'" >&2
+fi
+
+# 6.5 Home-dir reset helper  ~/reset-omni.sh  (+ per-slug wrapper) ---------------
+#     Between-sessions reset for a warm worktree: leaves every repo in the area
+#     DETACHED at its origin default and deletes merged session branches, so the
+#     next /work-start isn't confused by a stale (already-merged) feature branch.
+#     A linked worktree can never rest ON `release` (the main worktree holds it),
+#     which is exactly why the resting state is "detached at origin/release".
+#     The logic is area-agnostic (takes the slug as an arg), so we install ONE
+#     canonical copy from the bundled template (refreshed on every run) plus a
+#     tiny per-slug wrapper matching the ~/<slug>.sh / ~/start-omni-<slug>.sh feel.
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SKILL_DIR/reset-omni.sh" ]]; then
+  cp -p "$SKILL_DIR/reset-omni.sh" "$HOME/reset-omni.sh"
+  chmod +x "$HOME/reset-omni.sh"
+else
+  echo "WARN: reset-omni.sh template missing in $SKILL_DIR — skipping reset helper" >&2
+fi
+cat > "$HOME/reset-omni-${SLUG}.sh" <<EOF
+#!/usr/bin/env bash
+# Reset the ${SLUG} warm worktree to a clean between-sessions state
+# (thin wrapper around the generic ~/reset-omni.sh).
+exec "\$HOME/reset-omni.sh" ${SLUG} "\$@"
+EOF
+chmod +x "$HOME/reset-omni-${SLUG}.sh"
+
+# 7. Register the area in Terminal Keeper (VS Code) ------------------------------
+#    ~/source/repos/.vscode/sessions.json is the Terminal Keeper config that drives
+#    one restorable terminal per warm-worktree area (each cd's into the area root and
+#    runs `claude -c`). Without this step the new area exists on disk but never shows
+#    up as a VS Code terminal — the step everyone forgets by hand (subrights drifted
+#    out of the file this way). Idempotent (skips if the slug is already present) and
+#    non-fatal (warns and continues if jq is missing or the file is absent).
+#    Overrides: TK_ICON=<codicon-id> and TK_COLOR=terminal.ansi<Name> to set them
+#    explicitly; otherwise icon defaults to git-branch and color auto-rotates to the
+#    first ANSI color not already used by an existing area.
+TK="$REPOS/.vscode/sessions.json"
+if command -v jq >/dev/null 2>&1 && [[ -f "$TK" ]]; then
+  if jq -e --arg n "$SLUG" '.sessions.default[]? | select(.name == $n)' "$TK" >/dev/null 2>&1; then
+    echo ">> Terminal Keeper: '$SLUG' already registered in sessions.json — leaving as-is"
+  else
+    ICON="${TK_ICON:-git-branch}"
+    COLOR="${TK_COLOR:-}"
+    if [[ -z "$COLOR" ]]; then
+      USED=" $(jq -r '[.sessions.default[]?.color] | join(" ")' "$TK") "
+      COLOR="terminal.ansiWhite"   # fallback if every preferred color is taken
+      for c in terminal.ansiRed terminal.ansiBrightBlue terminal.ansiBrightMagenta \
+               terminal.ansiBrightCyan terminal.ansiBrightGreen terminal.ansiBrightYellow \
+               terminal.ansiBrightRed terminal.ansiWhite terminal.ansiBlue \
+               terminal.ansiMagenta terminal.ansiCyan terminal.ansiGreen terminal.ansiYellow; do
+        [[ "$USED" == *" $c "* ]] || { COLOR="$c"; break; }
+      done
+    fi
+    tmp="$(mktemp)"
+    # --indent 4 matches the file's existing style. += autovivifies .sessions.default.
+    if jq --indent 4 --arg n "$SLUG" --arg cwd "$WT/" --arg icon "$ICON" --arg color "$COLOR" '
+         .sessions.default += [{
+           name: $n,
+           cwd: $cwd,
+           commands: ["claude -c"],
+           autoExecuteCommands: true,
+           icon: $icon,
+           color: $color
+         }]' "$TK" > "$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
+      mv "$tmp" "$TK"
+      echo ">> Terminal Keeper: registered '$SLUG' (icon=$ICON, color=$COLOR)"
+    else
+      rm -f "$tmp"
+      echo "!! Terminal Keeper: failed to update $TK — add the '$SLUG' entry by hand" >&2
+    fi
+  fi
+else
+  echo "!! Terminal Keeper: jq missing or $TK absent — add the '$SLUG' entry by hand" >&2
+fi
+
+# 8. Verify ----------------------------------------------------------------------
+echo
+echo ">> done. verification:"
+for repo in "${REPO_ORDER[@]}"; do
+  printf "   %-42s %s\n" "$repo" "$(git -C "$WT/$repo" branch --show-current)"
+done
+echo "   workspace file : $([[ -f "$WT/Treeline.Omnibus.code-workspace" ]] && echo ok || echo MISSING)"
+echo "   sentinel       : $([[ -f "$WT/.cc-keep-worktree" ]] && echo ok || echo MISSING)"
+if [[ -d "$WT/.claude/skills" && ! -L "$WT/.claude/skills" ]]; then
+  _nsk=$(find "$WT/.claude/skills" -maxdepth 1 -type l | wc -l | tr -d ' ')
+  _chart=""
+  [[ -e "$WT/.claude/skills/omnibus-publisher-ui" ]]     && _chart="$_chart omnibus-publisher-ui"
+  [[ -e "$WT/.claude/skills/publisher-landing-design" ]] && _chart="$_chart publisher-landing-design"
+  [[ -z "$_chart" ]] && _chart=" NONE — check the frontend repo's .claude/skills"
+  echo "   skills dir     : ok — merged, ${_nsk} skills linked; charters:${_chart}"
+elif [[ -L "$WT/.claude/skills" ]]; then
+  echo "   skills dir     : FALLBACK single symlink — frontend UI charters NOT discoverable"
+else
+  echo "   skills dir     : MISSING"
+fi
+echo "   node_modules   : $(du -sh "$EC/node_modules" 2>/dev/null | cut -f1 || echo MISSING)"
+echo "   launcher       : $HOME/${SLUG}.sh"
+echo "   dev stack      : $HOME/start-omni-${SLUG}.sh"
+echo "   reset helper   : $HOME/reset-omni-${SLUG}.sh  ->  $([[ -x "$HOME/reset-omni.sh" ]] && echo "$HOME/reset-omni.sh (ok)" || echo "MISSING")"
+echo "   terminal keeper: $([[ -f "$TK" ]] && jq -e --arg n "$SLUG" '.sessions.default[]?|select(.name==$n)' "$TK" >/dev/null 2>&1 && echo "registered in sessions.json" || echo "NOT registered — add by hand")"
+echo "   field-diff vs template (should be ONLY the slug-bearing lines):"
+diff "$HOME/start-omni-${START_TPL}.sh" "$HOME/start-omni-${SLUG}.sh" || true
