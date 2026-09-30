@@ -9,9 +9,15 @@ description: Use when querying or modifying any Treeline Azure SQL database dire
 
 **Every read-only activity goes through the `treeline-sql-diagnostics` MCP server. pyodbc is the write path.**
 
+**`cc:sql-diagnostics` owns how to drive that server** — its prerequisites and auth, `list_connections`
+verification, and the ordered workflows for performance triage, blocking investigation, and slow-query
+analysis. Load it whenever the read is a diagnostic one. *This* skill owns the routing decision, the
+write path, and the server/database topology below — it deliberately does not restate those workflows.
+
 | What you're doing | Path |
 |---|---|
-| **Any read** — SELECT, row counts, verifying state, schema spelunking, diagnostics | **MCP server.** Use the specialized tool when one fits (`table_schema`, `find_objects`, `top_cpu_queries`, `blocking_chains`, …); fall back to `execute_query` only for ad-hoc business-data SELECTs |
+| **Any read** — SELECT, row counts, verifying state, schema spelunking | **MCP server.** Use the specialized tool when one fits (`table_schema`, `find_objects`, …); `execute_query` only for ad-hoc business-data SELECTs |
+| **A diagnostic read** — slow queries, blocking, waits, plans, index health | **MCP server, driven by `cc:sql-diagnostics`.** It has ordered workflows; don't improvise a tool sequence |
 | **Any write** — INSERT / UPDATE / DELETE / MERGE / DDL / writing EXEC | **pyodbc**, under the inline-approval rule below. MCP `execute_query` rejects non-SELECT by design |
 | A read the MCP genuinely cannot reach | pyodbc — but **name the gap in chat first** (see coverage below) |
 
@@ -42,7 +48,11 @@ Nine named connections. Pass the name via the `connection` parameter; `list_conn
    server has no cross-database context switching, unlike the MI.
 2. **Any Ingest DB other than prod `Ingest`** — `Ingest-qa`, `Ingest-staging`, `Ingest-dev`, and
    **everything on `treeline-ingest-sql-dev`**, which has no MCP connection at all.
-3. **The MCP server is not loaded, or a tool errors.** Surface the failure in chat, then fall back.
+3. **The MCP server is unavailable.** If it isn't registered at all, the fix is **`/cc-bootstrap`**, which
+   writes it into `~/.claude.json` — see `cc:sql-diagnostics` § Prerequisites, which owns setup and the
+   Azure auth the server needs. Dropping to pyodbc is what you do when you can't fix that right now; it
+   is not the remedy. If one tool errors against a server that *is* registered, say so and fall back for
+   that query only — don't abandon the MCP path wholesale.
 
 ### The two identities — they are not the same principal
 
@@ -198,4 +208,6 @@ while True:
 
 - `project_user_privilege_grant_path.md` — group-based privilege model in CatalogManagement, the SP that serves privileges, and the two caches that gate downstream visibility. Read before granting any `ingest.*` or similar privilege.
 - `title-manager-data-sources` skill — write-shape rules for Title Manager (IsbnMaster ↔ BookAttribute sync contract, ONIX SP boundary). Applies when the direct-SQL work touches title data.
-- `cc:sql-diagnostics` skill — guided workflows over the same MCP server. That server is now the default path for *all* reads, not just the diagnostic ones, so read it alongside this skill rather than after it.
+- `cc:sql-diagnostics` skill — **the companion to this one.** It owns the MCP server: prerequisites, auth,
+  connection verification, and the diagnostic workflows. This skill owns routing, writes, and topology.
+  Between them the rule is: reads and diagnostics there, writes here.
