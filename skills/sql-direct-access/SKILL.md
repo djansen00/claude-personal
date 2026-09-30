@@ -1,11 +1,55 @@
 ---
 name: sql-direct-access
-description: Use when querying or modifying any Treeline Azure SQL database directly from Claude — reads OR writes. Covers the corporate SQL Managed Instance (atl-sqlmi-01 → CatalogManagement, TreelineUW, Configuration, CatalogProcessing, Matterhorn, SalesTracking, Support, CampaignBuilder), the Omnibus app DB (treeline-omnibus-sql, private-endpoint-only) including the per-tenant `Omnibus-barn01..11` databases, and the Ingest databases on `treeline-ingest-sql` (prod) and `treeline-ingest-sql-dev` (dev). Triggers include: "check the database", "query the DB", "look at the data", "verify state in SQL", "what's in <table>", "let me look up <ID>", ad-hoc data fixes, user-privilege grants, schema spelunking, or any time direct SQL is the right tool because EF / the Treeline.Services.* repos don't fit. Includes the pyodbc + az CLI access-token connection pattern, the load-bearing inline-approval rule for non-read queries (INSERT/UPDATE/DELETE/MERGE/DDL/EXEC-with-writes), the bi-modal serverless-DB auto-pause/auto-resume caveat, and the per-server connection strings.
+description: Use when querying or modifying any Treeline Azure SQL database directly from Claude — reads OR writes. Covers the corporate SQL Managed Instance (atl-sqlmi-01 → CatalogManagement, TreelineUW, Configuration, CatalogProcessing, Matterhorn, SalesTracking, Support, CampaignBuilder), the Omnibus app DB (treeline-omnibus-sql, private-endpoint-only) including the per-tenant `Omnibus-barn01..11` databases, and the Ingest databases on `treeline-ingest-sql` (prod) and `treeline-ingest-sql-dev` (dev). Triggers include: "check the database", "query the DB", "look at the data", "verify state in SQL", "what's in <table>", "let me look up <ID>", ad-hoc data fixes, user-privilege grants, schema spelunking, or any time direct SQL is the right tool because EF / the Treeline.Services.* repos don't fit. **Routing rule: every read goes through the `treeline-sql-diagnostics` MCP server; pyodbc is only for writes and for the documented MCP coverage gaps.** Includes the pyodbc + az CLI access-token connection pattern, the load-bearing inline-approval rule for non-read queries (INSERT/UPDATE/DELETE/MERGE/DDL/EXEC-with-writes), the bi-modal serverless-DB auto-pause/auto-resume caveat, and the per-server connection strings.
 ---
 
-# Direct SQL access (pyodbc) — connection pattern + safety rule
+# Direct SQL access — MCP for reads, pyodbc for writes
 
-You have direct SQL access to the corporate Azure SQL MI from this WSL environment via **pyodbc** + an **az CLI access token**. This is the path used for ad-hoc reads, user-privilege grants, and other one-off SQL that doesn't fit through the .NET service repos.
+## 🚦 Routing rule — decide this before you open a connection
+
+**Every read-only activity goes through the `treeline-sql-diagnostics` MCP server. pyodbc is the write path.**
+
+| What you're doing | Path |
+|---|---|
+| **Any read** — SELECT, row counts, verifying state, schema spelunking, diagnostics | **MCP server.** Use the specialized tool when one fits (`table_schema`, `find_objects`, `top_cpu_queries`, `blocking_chains`, …); fall back to `execute_query` only for ad-hoc business-data SELECTs |
+| **Any write** — INSERT / UPDATE / DELETE / MERGE / DDL / writing EXEC | **pyodbc**, under the inline-approval rule below. MCP `execute_query` rejects non-SELECT by design |
+| A read the MCP genuinely cannot reach | pyodbc — but **name the gap in chat first** (see coverage below) |
+
+Reaching for pyodbc on a read *without* hitting one of the documented gaps is the specific mistake
+this rule exists to prevent. The MCP path is faster, is capped at sane row counts, cannot mutate
+state through `execute_query`, and its specialized tools return curated columns instead of raw DMV
+dumps.
+
+⚠️ **`execute_proc` is the one MCP tool that can mutate.** "MCP" does not automatically mean "safe" —
+if the proc writes, the inline-approval rule below applies exactly as it would to pyodbc.
+
+### What the MCP actually covers (verified 2026-09-30)
+
+Nine named connections. Pass the name via the `connection` parameter; `list_connections` re-checks.
+
+| Connection | Server | Default DB | Reaches |
+|---|---|---|---|
+| `atl-sqlmi-01` | `atl-sqlmi-01.8c316f7fa116.database.windows.net` | `master` | **All MI databases** — pass `database` to switch (verified `master` → `CatalogManagement`) |
+| `Omnibus` | `treeline-omnibus-sql.database.windows.net` | `Omnibus` | **`Omnibus` only** |
+| `Ingest` | `treeline-ingest-sql.database.windows.net` | `Ingest` | **prod `Ingest` only** |
+| `Advertising`, `Designer`, `Events`, `Messaging`, `ta-sql`, `Analytics Lakehouse` | various | various | Servers this skill does not otherwise document — available, untested here |
+
+### The coverage gaps — the *only* sanctioned pyodbc reads
+
+1. **Any Omnibus DB other than `Omnibus`.** `Omnibus-dev`, `Omnibus-qa`, `Omnibus-EDI`,
+   `Omnibus-barn01`…`barn11`, the dated restores. Verified failing 2026-09-30: the `database`
+   override errors on the `Omnibus` connection. Expected — a single-database Azure SQL logical
+   server has no cross-database context switching, unlike the MI.
+2. **Any Ingest DB other than prod `Ingest`** — `Ingest-qa`, `Ingest-staging`, `Ingest-dev`, and
+   **everything on `treeline-ingest-sql-dev`**, which has no MCP connection at all.
+3. **The MCP server is not loaded, or a tool errors.** Surface the failure in chat, then fall back.
+
+### The two identities — they are not the same principal
+
+The MCP connects as a **service principal** (`95c63f21-9f3d-4dac-8fb8-99f40208c2cd`). pyodbc
+connects as **Dave's own az CLI identity**. A read that works on one path can be denied on the
+other, and the audit trail attributes them to different actors. When a permission error looks
+surprising, check which identity you were using before concluding the data isn't there.
 
 ## 🛑 Load-bearing rule — non-read queries require inline display + explicit approval
 
@@ -33,7 +77,9 @@ Non-read = anything that mutates state:
 
 If the hook or classifier blocks despite the inline-approval dance: stop, surface the block to the user, and ask for re-approval. **Do not retry the same command in different shapes hoping it slips through.** That's a workaround, not a fix.
 
-## Connection pattern (verified 2026-05-12, WSL Ubuntu)
+## Connection pattern — the write path (verified 2026-05-12, WSL Ubuntu)
+
+Use this for writes, and for reads only when one of the three coverage gaps above applies.
 
 ```python
 import subprocess, struct, pyodbc
@@ -144,7 +190,7 @@ while True:
 
 ## When NOT to use this path
 
-- **Diagnostics** (slow query analysis, blocking, plans, missing indexes): prefer the `treeline-sql-diagnostics` MCP server if loaded — it's purpose-built and read-only. The pyodbc path is for one-off reads/writes the MCP doesn't cover.
+- **Any read at all** — not just diagnostics: use the `treeline-sql-diagnostics` MCP server. See the routing rule at the top. pyodbc reads are limited to the three documented coverage gaps, and you should say which one you hit.
 - **Omnibus app data** (reading/writing `Omnibus.dbo.*`): prefer the .NET service path. Direct SQL bypasses the layered architecture, the repository pattern, and the read-only-projection invariant for `Treeline.Data` scaffolded entities.
 - **Treeline.Data scaffolded contexts** (CatalogManagement / TreelineUW): these are **read-only projections** in the .NET layer. Writes through them are greenfield and require an EntityConfiguration audit — but writing direct SQL via pyodbc to those DBs is the explicitly sanctioned path for ad-hoc fixes.
 
@@ -152,4 +198,4 @@ while True:
 
 - `project_user_privilege_grant_path.md` — group-based privilege model in CatalogManagement, the SP that serves privileges, and the two caches that gate downstream visibility. Read before granting any `ingest.*` or similar privilege.
 - `title-manager-data-sources` skill — write-shape rules for Title Manager (IsbnMaster ↔ BookAttribute sync contract, ONIX SP boundary). Applies when the direct-SQL work touches title data.
-- `cc:sql-diagnostics` skill — diagnostic workflows via the MCP server, complementary to this one.
+- `cc:sql-diagnostics` skill — guided workflows over the same MCP server. That server is now the default path for *all* reads, not just the diagnostic ones, so read it alongside this skill rather than after it.
